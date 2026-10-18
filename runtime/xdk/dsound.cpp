@@ -203,6 +203,12 @@ void Complete(Voice& v, Packet& pk, uint32_t status) {
     }
 }
 
+// the console's stereo downmix: centre, back pair and back crosstalk at -3 dB, the sub dropped
+float StereoFold(uint32_t bin) {
+    bool folded = bin == 2 || bin == 4 || bin == 5 || bin == 8 || bin == 9;
+    return folded ? 0.707f : 1.0f;
+}
+
 // gain of voice channel c on host left and right. A hardware voice holds two channels and owns a run of slots,
 // which alternate left and right.
 void Levels(Voice& v, float g[2][2]) {
@@ -217,10 +223,18 @@ void Levels(Voice& v, float g[2][2]) {
         for (uint32_t s = c; c < v.channels && s < per && s < n; s += step) {
             uint32_t b = bin[s];
             if (speakers && (b == 3 || b > 9)) continue;  // sub and effect sends
-            float x = Db(v.bin_mb[b]) * v.volume * v.headroom * (b == 2 ? 0.707f : 1.0f);
+            float x = Db(v.bin_mb[b]) * v.volume * v.headroom * StereoFold(b);
             // even bins are left, odd right, 2 is the centre
-            if (!speakers || b == 2 || !(b & 1)) g[c][0] = std::max(g[c][0], x);
-            if (!speakers || b == 2 || (b & 1)) g[c][1] = std::max(g[c][1], x);
+            bool left = !speakers || b == 2 || !(b & 1);
+            bool right = !speakers || b == 2 || (b & 1);
+            // slots that reach one speaker add, as on the DSP; effect sends alone play the loudest
+            if (speakers) {
+                if (left) g[c][0] += x;
+                if (right) g[c][1] += x;
+            } else {
+                g[c][0] = std::max(g[c][0], x);
+                g[c][1] = std::max(g[c][1], x);
+            }
         }
     }
     if (!v.is3d || v.mode == 2) return;
