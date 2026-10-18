@@ -25,7 +25,7 @@ This tool was originally created for porting [Tom Clancy's Splinter Cell: Double
 2. Put the game's XBE and its data folders in the `assets` folder. No game files, keys or generated code belong in any repository.
 3. Run `xbe_symbols`, which `build.bat` does on the first build:
    ```
-   xbe_symbols assets\default.xbe sdk\xdk --out config\game.toml
+   xbe_symbols assets\default.xbe sdk\xdk --library MyGame.dll --out config\game.toml
    ```
    This prints the XBE's library versions, picks `xdk/<build>/signatures.toml` and finds the XDK functions and data the host replaces, then writes the config: `[xbe]` with a partition count and the code sections, the `layout.toml` include, `[symbols]` and `[data]`. Misses and ambiguous names are listed and left at 0, which become trapping stubs. It stops when no `signatures.toml` exists for the XBE's build.
 4. Fill in `app::kGame` in `src/common/game_info.cpp`: title, window name, log and settings file names, splash, the xbe to exe table, game options, and the hooks for loading, the window, drawing and the pads.
@@ -45,6 +45,7 @@ A new XDK build needs `xdk/<build>/layout.toml` and signatures made from titles 
 - **Instruction Hooks** - Adds `[[hook]]`, which calls a game function before or after any instruction, and can return from or jump within the function.
 - **Analysis Overrides** - Adds `[[function]]`, `[[switch]]` and `[xbe] data_ranges` to add functions, set switch targets and mark data the analysis gets wrong.
 - **Incremental Builds** - Only rewrites generated files when their content changes, keeping rebuilds fast.
+- **Game Code on the Player's PC** - Builds the recompiled code into `<exe>.dll` on the first start of a release, from the player's own XBE, with the bundled recompiler, Clang and LLD behind a progress window. A release ships no game code.
 - **XDK Signatures** - Finds the XDK functions and data in a new game automatically and writes its config.
 - **LTCG Libraries** - Supports games built with link time code generation, where library functions take their arguments in registers.
 
