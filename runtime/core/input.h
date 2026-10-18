@@ -11,8 +11,7 @@ struct Pad {
     int16_t lx = 0, ly = 0, rx = 0, ry = 0;
 };
 
-void Init();  // window thread, before boot; the game code window starts it earlier
-uint16_t HeldOnAnyController();  // face buttons as XINPUT_GAMEPAD_A/B/X/Y masks, GameInfo::pad left out
+void Init();  // window thread, before boot
 // the controller on that port, then GameInfo::pad
 Pad Poll(int port);
 void Rumble(int port, uint16_t left, uint16_t right);
