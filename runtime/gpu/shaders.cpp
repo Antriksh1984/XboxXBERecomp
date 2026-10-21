@@ -582,6 +582,45 @@ uint64_t Hash(const void* p, size_t n, uint64_t h) {
     return mix(seed ^ k0, uint64_t(n) ^ k1);
 }
 
+namespace {
+
+// D3DTOP and D3DTA values PixelKey::ff holds
+constexpr uint32_t kTopSelectArg1 = 2;
+constexpr uint32_t kTopSelectArg2 = 3;
+constexpr uint32_t kTopBlendTextureAlpha = 14;
+constexpr uint32_t kTopBlendTextureAlphaPm = 16;
+constexpr uint32_t kTopModulateAlphaAddColor = 18;
+constexpr uint32_t kTopModulateInvColorAddAlpha = 21;
+constexpr uint32_t kTopMultiplyAdd = 23;
+constexpr uint32_t kTopLerp = 24;
+constexpr uint32_t kTaCurrent = 1;
+constexpr uint32_t kTaTexture = 2;
+
+// args in PixelKey::ff order: arg1, arg2, arg0
+bool ReadsTexture(uint32_t op, const uint32_t* args, bool alpha) {
+    if (op == kTopBlendTextureAlpha || op == kTopBlendTextureAlphaPm) return true;
+    bool alpha_arg1_only = alpha && op >= kTopModulateAlphaAddColor && op <= kTopModulateInvColorAddAlpha;
+    bool uses_arg1 = op != kTopSelectArg2;
+    bool uses_arg2 = op != kTopSelectArg1 && !alpha_arg1_only;
+    bool uses_arg0 = op == kTopMultiplyAdd || op == kTopLerp;
+    auto texture = [](uint32_t a) { return (a & 0xF) == kTaTexture; };
+    return (uses_arg1 && texture(args[0])) || (uses_arg2 && texture(args[1])) || (uses_arg0 && texture(args[2]));
+}
+
+// the XDK's combiner builder turns a stage op that reads a missing texture into a pass of the current colour
+void PassMissingTexture(uint32_t* f) {
+    if (f[0] > 1 && ReadsTexture(f[0], f + 1, false)) {
+        f[0] = kTopSelectArg1;
+        f[1] = kTaCurrent;
+    }
+    if (f[4] > 1 && ReadsTexture(f[4], f + 5, true)) {
+        f[4] = kTopSelectArg1;
+        f[5] = kTaCurrent;
+    }
+}
+
+}  // namespace
+
 PixelKey MakePixelKey(const State& s, const TexInfo tex[4]) {
     PixelKey k;
     std::memset(&k, 0, sizeof(k));
@@ -626,6 +665,7 @@ PixelKey MakePixelKey(const State& s, const TexInfo tex[4]) {
         uint32_t v[9] = {t[kTssColorOp], t[kTssColorArg1], t[kTssColorArg2], t[kTssColorArg0], t[kTssAlphaOp],
                          t[kTssAlphaArg1],  t[kTssAlphaArg2], t[kTssAlphaArg0], t[kTssResultArg]};
         std::memcpy(k.ff[i], v, sizeof(v));
+        if (!tex[i].kind) PassMissingTexture(k.ff[i]);
         if (program || (t[kTssTextureTransformFlags] & 0x100)) k.proj |= 1u << i;  // D3DTTFF_PROJECTED
         if (t[kTssColorOp] <= 1) break;
     }
