@@ -11,6 +11,7 @@
 #include "app/app.h"
 #include "core/diag.h"
 #include "gpu/backend.h"
+#include "gpu/shaders.h"
 #include "gpu/texture.h"
 #include "gpu/vertex.h"
 #include "xdk/d3d8.h"
@@ -18,6 +19,10 @@
 #include "xdk/layout.h"
 
 using namespace kernel;
+
+namespace dispatch {
+bool InCode(uint32_t va);  // cpu/dispatch.cpp
+}
 
 // configs written before the SDK knew the name
 #ifndef SYM_D3DDevice_BeginPush
@@ -38,6 +43,18 @@ using namespace kernel;
 #ifndef SYM_D3DDevice_GetVertexShaderFunction
 #define SYM_D3DDevice_GetVertexShaderFunction FFFFFE03
 #define HAS_D3DDevice_GetVertexShaderFunction 0
+#endif
+#ifndef SYM_D3DDevice_GetTile
+#define SYM_D3DDevice_GetTile FFFFFE04
+#define HAS_D3DDevice_GetTile 0
+#endif
+#ifndef SYM_D3DDevice_SetRenderTargetFast
+#define SYM_D3DDevice_SetRenderTargetFast FFFFFE05
+#define HAS_D3DDevice_SetRenderTargetFast 0
+#endif
+#ifndef SYM_D3DDevice_LoadVertexShaderProgram
+#define SYM_D3DDevice_LoadVertexShaderProgram FFFFFE06
+#define HAS_D3DDevice_LoadVertexShaderProgram 0
 #endif
 
 namespace d3d {
@@ -339,7 +356,7 @@ HLE_STDCALL(D3D_BlockOnResource, 1) {
                 uint32_t code[4] = {}, n = 0;
                 for (uint32_t i = 0; i < 32 && n < 4; i++) {
                     uint32_t v = R32(ctx.esp + i * 4);
-                    if (v >= X86CodeBase && v < X86CodeEnd) code[n++] = v;
+                    if (dispatch::InCode(v)) code[n++] = v;
                 }
                 LOGI("d3d: BlockOnResource on surface %08X, stack %08X %08X %08X %08X", data, code[0], code[1], code[2], code[3]);
             }
@@ -443,11 +460,12 @@ HLE_STDCALL(D3DDevice_SetGammaRamp, 2) {
 
 // targets and presentation
 
-HLE_STDCALL(D3DDevice_SetRenderTarget, 2) {
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
-    uint32_t rt = a[0] ? a[0] : Dev(kDevRenderTarget), zs = a[1];
+namespace {
+// the device's targets become rt and zs, the references move from the old ones
+void ApplyRenderTarget(X86Context& ctx, uint32_t rt, uint32_t zs) {
     AddRef(ctx, rt);
-    uint32_t old_rt = Dev(kDevRenderTarget), old_zs = Dev(kDevDepth);
+    uint32_t old_rt = Dev(kDevRenderTarget);
+    uint32_t old_zs = Dev(kDevDepth);
     SetDev(kDevRenderTarget, rt);
     SetDev(kDevDepth, zs);
     AddRef(ctx, zs);
@@ -455,11 +473,25 @@ HLE_STDCALL(D3DDevice_SetRenderTarget, 2) {
     Release(ctx, old_zs);
     g_state.rt = SurfaceOf(rt);
     g_state.zs = SurfaceOf(zs);
+}
+}  // namespace
+
+HLE_STDCALL(D3DDevice_SetRenderTarget, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    uint32_t rt = a[0] ? a[0] : Dev(kDevRenderTarget);
+    ApplyRenderTarget(ctx, rt, a[1]);
     // SetRenderTarget resets the viewport to the whole target
     uint32_t w, h;
     gpu::SurfaceSize(g_state.rt, w, h);
     g_state.viewport = {0, 0, w, h, 0.0f, 1.0f};
     UpdateViewportConstants();
+    return 0;
+}
+
+// (rt, zs, flags): the surfaces alone, the viewport stays as it was
+HLE_STDCALL(D3DDevice_SetRenderTargetFast, 3) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    ApplyRenderTarget(ctx, a[0], a[1]);
     return 0;
 }
 
@@ -842,12 +874,133 @@ HLE_FASTCALL(D3DDevice_SetVertexShaderConstantNotInlineFast, 1) {
     return 0;
 }
 
+// Vertex program memory: Load writes instructions at a slot, Select runs the program that starts at one
+namespace {
+constexpr uint32_t kProgramSlots = 136;
+constexpr uint32_t kInstructionDwords = 4;
+constexpr uint32_t kLastInstruction = 1;  // bit 0 of an instruction's fourth dword
+constexpr uint32_t kVertexProgramType = 0x2078;
+constexpr uint32_t kInputRegisters = 16;
+
+// guest vertex shader object, the record a handle points at
+constexpr uint32_t kShaderInputs = 0x14;  // 16 inputs of {stream, offset, D3DVSDT type, unused}
+constexpr uint32_t kShaderInputBytes = 16;
+constexpr uint32_t kTypeNone = 0x02;  // D3DVSDT_NONE
+
+std::array<uint32_t, kProgramSlots * kInstructionDwords> g_program_memory{};
+std::map<uint64_t, std::shared_ptr<gpu::VertexShader>> g_selected;  // kept alive, the render thread keys by pointer
+
+// bytes of one D3DVSDT element: kind in the low nibble, count in the next
+uint32_t ElementBytes(uint32_t type) {
+    uint32_t kind = type & 15;
+    uint32_t count = (type >> 4) & 15;
+    if (kind == 0 || kind == 6) return 4;          // D3DCOLOR, packed 11:11:10
+    if (kind == 1 || kind == 5) return 2 * count;  // shorts
+    if (kind == 4) return count;                   // bytes
+    return 4 * count;                              // floats
+}
+
+void StoreProgram(uint32_t slot, const std::vector<uint32_t>& words) {
+    if (slot >= kProgramSlots) return;
+    size_t room = g_program_memory.size() - slot * kInstructionDwords;
+    std::copy_n(words.begin(), std::min(words.size(), room), g_program_memory.begin() + slot * kInstructionDwords);
+}
+
+// a {type | count << 16, instructions} function's instructions
+std::vector<uint32_t> FunctionWords(uint32_t function) {
+    uint32_t count = R32(function) >> 16;
+    std::vector<uint32_t> words(count * kInstructionDwords);
+    for (uint32_t i = 0; i < words.size(); i++) words[i] = R32(function + 4 + i * 4);
+    return words;
+}
+
+// the instructions from slot to the last one
+std::vector<uint32_t> ProgramAt(uint32_t slot) {
+    std::vector<uint32_t> program;
+    for (; slot < kProgramSlots; slot++) {
+        const uint32_t* insn = &g_program_memory[slot * kInstructionDwords];
+        program.insert(program.end(), insn, insn + kInstructionDwords);
+        if (insn[3] & kLastInstruction) break;
+    }
+    return program;
+}
+
+// a guest made shader's inputs, as its object holds them
+void ApplyGuestInputs(uint32_t handle, gpu::VertexShader& vs) {
+    uint32_t inputs = (handle & ~1u) + kShaderInputs;
+    for (uint32_t reg = 0; reg < kInputRegisters; reg++) {
+        uint32_t entry = inputs + reg * kShaderInputBytes;
+        uint32_t stream = R32(entry);
+        uint32_t offset = R32(entry + 4);
+        uint32_t type = R32(entry + 8);
+        if (type == kTypeNone || stream >= vs.stream_stride.size()) continue;
+        vs.inputs[reg] = {int(stream), offset, type};
+        uint32_t end = offset + ElementBytes(type);
+        vs.stream_stride[stream] = std::max(vs.stream_stride[stream], end);
+    }
+}
+
+// the vertex inputs a selected program reads: a host made shader's, else the guest object's
+void ApplyShaderInputs(uint32_t handle, gpu::VertexShader& vs) {
+    auto it = g_vs.find(handle);
+    if (it == g_vs.end()) {
+        ApplyGuestInputs(handle, vs);
+        return;
+    }
+    vs.inputs = it->second->inputs;
+    vs.stream_stride = it->second->stream_stride;
+}
+
+// one shader object per program and input layout; handle 0 keeps the bound shader's inputs
+std::shared_ptr<gpu::VertexShader> SelectedShader(uint32_t handle, uint32_t slot) {
+    gpu::VertexShader vs;
+    vs.program = ProgramAt(slot);
+    vs.program_type = kVertexProgramType;
+    if (handle) {
+        ApplyShaderInputs(handle, vs);
+    } else {
+        vs.inputs = g_state.vs->inputs;
+        vs.stream_stride = g_state.vs->stream_stride;
+    }
+    uint64_t key = gpu::Hash(vs.program.data(), vs.program.size() * 4);
+    key = gpu::Hash(vs.inputs.data(), sizeof(vs.inputs), key);
+    key = gpu::Hash(vs.stream_stride.data(), sizeof(vs.stream_stride), key);
+    auto& kept = g_selected[key];
+    if (!kept) kept = std::make_shared<gpu::VertexShader>(std::move(vs));
+    return kept;
+}
+}  // namespace
+
+// (handle, slot): the program a shader was made with, stored at the slot
 HLE_STDCALL(D3DDevice_LoadVertexShader, 2) {
-    LOG_FIRST(4, "d3d: LoadVertexShader %08X at %u is not supported", a[0], a[1]);
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    auto it = g_vs.find(a[0]);
+    if (it == g_vs.end()) {
+        LOG_FIRST(8, "d3d: LoadVertexShader with unknown handle %08X", a[0]);
+        return 0;
+    }
+    StoreProgram(a[1], it->second->program);
     return 0;
 }
+
+// (function, slot)
+HLE_STDCALL(D3DDevice_LoadVertexShaderProgram, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    StoreProgram(a[1], FunctionWords(a[0]));
+    return 0;
+}
+
+// (handle, slot): the program at the slot runs with the handle's inputs; handle 0 only moves the start
 HLE_STDCALL(D3DDevice_SelectVertexShader, 2) {
-    LOG_FIRST(4, "d3d: SelectVertexShader %08X at %u is not supported", a[0], a[1]);
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    uint32_t handle = a[0];
+    bool program_bound = (g_state.vs_handle & 1) && g_state.vs;
+    if (!handle && !program_bound) {
+        LOG_FIRST(8, "d3d: SelectVertexShader at slot %u without a bound vertex shader", a[1]);
+        return 0;
+    }
+    g_state.vs = SelectedShader(handle, a[1]);
+    if (handle) g_state.vs_handle = handle;
     return 0;
 }
 HLE_STDCALL(D3DDevice_SetShaderConstantMode, 1) {
@@ -1049,8 +1202,79 @@ void EndPrimitive() {
     g_state.vs_handle = handle;
 }
 
+// a begin/end or vertex data method opens, feeds or draws the immediate primitive; false for any other method
+bool ApplyImmediate(uint32_t m, uint32_t v) {
+    float f;
+    float* a = g_im_attr;
+    bool last = true;  // the slot's last component
+    std::memcpy(&f, &v, 4);
+    if (m == 0x17FC) {  // begin/end, 0 ends
+        if (v) {
+            g_im_prim = v;
+            g_im_mask = 0;
+            g_im_vertices.clear();
+        } else {
+            EndPrimitive();
+        }
+        return true;
+    } else if (m >= 0x1880 && m < 0x1900) {  // 2 floats, z = 0 and w = 1
+        a += (m - 0x1880) / 8 * 4;
+        last = (m - 0x1880) / 4 & 1;
+        a[last] = f;
+        a[2] = 0;
+        a[3] = 1;
+    } else if (m >= 0x1940 && m < 0x1980) {  // 4 bytes
+        a += (m - 0x1940) / 4 * 4;
+        for (int c = 0; c < 4; c++) a[c] = (v >> c * 8 & 0xFF) / 255.0f;
+    } else if (m >= 0x1A00 && m < 0x1B00) {  // 4 floats
+        a += (m - 0x1A00) / 16 * 4;
+        last = ((m - 0x1A00) / 4 & 3) == 3;
+        a[(m - 0x1A00) / 4 & 3] = f;
+    } else if (m >= 0x1500 && m < 0x150C) {  // position, 3 floats and w = 1
+        last = m == 0x1508;
+        a[(m - 0x1500) / 4] = f;
+        a[3] = 1;
+    } else if (m >= 0x1518 && m < 0x1528) {  // position, 4 floats
+        last = m == 0x1524;
+        a[(m - 0x1518) / 4] = f;
+    } else {
+        return false;
+    }
+    if (!g_im_prim) return true;
+    g_im_mask |= 1u << (a - g_im_attr) / 4;
+    if (a == g_im_attr && last) g_im_vertices.insert(g_im_vertices.end(), g_im_attr, g_im_attr + 64);
+    return true;
+}
+
+// Vertex constants a title pushes itself (007 does a skinned mesh's ambient and material colour so): a load
+// register, then four dwords per register from it on
+constexpr uint32_t kConstantLoad = 0x1EA4;
+constexpr uint32_t kConstantData = 0x0B80;
+constexpr uint32_t kConstantDataEnd = 0x0C00;
+constexpr uint32_t kConstantRegisters = 192;
+uint32_t g_constant_register = 0;
+uint32_t g_constant_component = 0;
+
+// a constant load or data method updates the vertex constants; false for any other method
+bool ApplyConstant(uint32_t m, uint32_t v) {
+    if (m == kConstantLoad) {
+        g_constant_register = v;
+        g_constant_component = 0;
+        return true;
+    }
+    if (m < kConstantData || m >= kConstantDataEnd) return false;
+    if (g_constant_register < kConstantRegisters) {
+        std::memcpy(&g_state.vsc[g_constant_register][g_constant_component], &v, 4);
+    }
+    if (++g_constant_component == 4) {
+        g_constant_component = 0;
+        g_constant_register++;
+    }
+    return true;
+}
+
 // reads the commands pushed since the last call: vertex data between a begin and an end is drawn, visibility tests
-// are run, the rest is skipped
+// are run, constants are stored, the rest is skipped
 void Walk(uint32_t end) {
     if (!g_walk || end < g_walk || end > g_scratch_push + g_scratch_size) return;
     for (uint32_t p = g_walk; p + 4 <= end;) {
@@ -1059,46 +1283,10 @@ void Walk(uint32_t end) {
         p += 4;
         if ((head & 0xA0030003) || n * 4 > end - p) break;  // anything but a method header
         for (uint32_t i = 0; i < n; i++, p += 4) {
-            uint32_t m = head & 0x40000000 ? method : method + i * 4, v = R32(p);
-            float f, *a = g_im_attr;
-            bool last = true;  // the slot's last component
-            std::memcpy(&f, &v, 4);
+            uint32_t m = head & 0x40000000 ? method : method + i * 4;
+            uint32_t v = R32(p);
             ApplyVisibilityMethod(m, v);
-            if (m == 0x17FC) {  // begin/end, 0 ends
-                if (v) {
-                    g_im_prim = v;
-                    g_im_mask = 0;
-                    g_im_vertices.clear();
-                } else {
-                    EndPrimitive();
-                }
-                continue;
-            } else if (m >= 0x1880 && m < 0x1900) {  // 2 floats, z = 0 and w = 1
-                a += (m - 0x1880) / 8 * 4;
-                last = (m - 0x1880) / 4 & 1;
-                a[last] = f;
-                a[2] = 0;
-                a[3] = 1;
-            } else if (m >= 0x1940 && m < 0x1980) {  // 4 bytes
-                a += (m - 0x1940) / 4 * 4;
-                for (int c = 0; c < 4; c++) a[c] = (v >> c * 8 & 0xFF) / 255.0f;
-            } else if (m >= 0x1A00 && m < 0x1B00) {  // 4 floats
-                a += (m - 0x1A00) / 16 * 4;
-                last = ((m - 0x1A00) / 4 & 3) == 3;
-                a[(m - 0x1A00) / 4 & 3] = f;
-            } else if (m >= 0x1500 && m < 0x150C) {  // position, 3 floats and w = 1
-                last = m == 0x1508;
-                a[(m - 0x1500) / 4] = f;
-                a[3] = 1;
-            } else if (m >= 0x1518 && m < 0x1528) {  // position, 4 floats
-                last = m == 0x1524;
-                a[(m - 0x1518) / 4] = f;
-            } else {
-                continue;
-            }
-            if (!g_im_prim) continue;
-            g_im_mask |= 1u << (a - g_im_attr) / 4;
-            if (a == g_im_attr && last) g_im_vertices.insert(g_im_vertices.end(), g_im_attr, g_im_attr + 64);
+            if (!ApplyConstant(m, v)) ApplyImmediate(m, v);
         }
     }
     g_walk = end;
@@ -1114,11 +1302,20 @@ HLE_STDCALL(D3DDevice_DrawVerticesUP, 4) {
 }
 
 // BeginPush(dwords) hands out room for raw hardware commands, EndPush(end) runs what the title wrote there:
-// a primitive between two begin/end writes with its vertices inline, any other method as a simple state.
+// a primitive between two begin/end writes with its vertices inline or as vertex data, other methods as simple states.
 HLE_STDCALL(D3DDevice_BeginPush, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     g_push_begin = ScratchPush(a[0] * 4);
     return g_push_begin;
+}
+
+// a primitive whose vertices came as an inline array, in the bound vertex format
+static void DrawInline(uint32_t prim, const std::vector<uint32_t>& vertices) {
+    if (vertices.empty()) return;
+    uint32_t stride = VertexBytes();
+    uint32_t bytes = uint32_t(vertices.size()) * 4;
+    if (stride && bytes % stride == 0) DrawUp(prim, bytes / stride, vertices.data(), stride);
+    else LOG_FIRST(8, "d3d: EndPush primitive %u dropped, %u bytes of vertices of %u", prim, bytes, stride);
 }
 
 HLE_STDCALL(D3DDevice_EndPush, 1) {
@@ -1139,16 +1336,13 @@ HLE_STDCALL(D3DDevice_EndPush, 1) {
             ApplyVisibilityMethod(m, v);
             if (m == kInlineArray) {
                 if (prim) vertices.push_back(v);
-            } else if (m != kBeginEnd) {
-                if (m >> 2 < g_state.simple.size()) g_state.simple[m >> 2] = v;
-            } else if (v) {
+            } else if (m == kBeginEnd) {
+                if (!v && prim) DrawInline(prim, vertices);
                 prim = v;
                 vertices.clear();
-            } else if (prim) {
-                uint32_t stride = VertexBytes(), bytes = uint32_t(vertices.size()) * 4;
-                if (stride && bytes % stride == 0) DrawUp(prim, bytes / stride, vertices.data(), stride);
-                else LOG_FIRST(8, "d3d: EndPush primitive %u dropped, %u bytes of vertices of %u", prim, bytes, stride);
-                prim = 0;
+                ApplyImmediate(m, v);
+            } else if (!ApplyConstant(m, v) && !ApplyImmediate(m, v) && m >> 2 < g_state.simple.size()) {
+                g_state.simple[m >> 2] = v;
             }
         }
     }
@@ -1159,6 +1353,36 @@ HLE_STDCALL(D3DDevice_EndPush, 1) {
 
 // frame buffer compression tiles are the console's memory controller's business
 HLE_STDCALL(D3DDevice_SetTile, 2) { return 0; }
+
+// D3DTILE: flags, memory, size, pitch, z start tag, z offset
+constexpr uint32_t kTileMemory = 4;
+constexpr uint32_t kTileSize = 8;
+constexpr uint32_t kTilePitch = 12;
+constexpr uint32_t kTileBytes = 24;
+// tiles the library's CreateDevice sets
+constexpr uint32_t kBackBufferTile = 0;
+constexpr uint32_t kDepthTile = 1;
+// surface header fields
+constexpr uint32_t kSurfaceData = 4;
+constexpr uint32_t kSurfaceSize = 16;
+
+// (index, tile): the frame buffer memory a title wraps in its own textures, as 007 does for a depth texture
+HLE_STDCALL(D3DDevice_GetTile, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    uint32_t tile = a[1];
+    std::memset(HostPtr(tile), 0, kTileBytes);
+    uint32_t surface = 0;
+    if (a[0] == kBackBufferTile) surface = g_buffers[1];
+    if (a[0] == kDepthTile) surface = g_depth;
+    if (!surface) return 0;
+    uint32_t size = R32(surface + kSurfaceSize);
+    uint32_t pitch = ((size >> 24 & 0xFF) + 1) * 64;
+    uint32_t height = (size >> 12 & 0xFFF) + 1;
+    W32(tile + kTileMemory, mem::VirtualFromPhysical(R32(surface + kSurfaceData)));
+    W32(tile + kTileSize, pitch * height);
+    W32(tile + kTilePitch, pitch);
+    return 0;
+}
 
 // the library's Begin pushes the start of the primitive, here it is opened
 HLE_STDCALL(D3DDevice_Begin, 1) {
