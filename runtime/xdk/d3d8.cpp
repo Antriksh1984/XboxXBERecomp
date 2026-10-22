@@ -230,6 +230,51 @@ void ApplyDefaultStates(X86Context& ctx) {
 #endif
 }
 
+// The frame buffers a D3DPRESENT_PARAMETERS asks for become the device's targets, the viewport covers them. The
+// renderer is made at the first ones' size.
+void SetFrameBuffers(const char* caller, uint32_t pp) {
+    uint32_t w = R32(pp), h = R32(pp + 4), fmt = R32(pp + 8), count = std::max<uint32_t>(R32(pp + 12), 1);
+    uint32_t auto_depth = R32(pp + 0x20), depth_fmt = R32(pp + 0x24), interval = R32(pp + 0x30);
+    if (!w) w = 640;
+    if (!h) h = 480;
+    LOGI("d3d: %s %ux%u format %X buffers %u depth %u format %X interval %X flags %X", caller, w, h, fmt, count,
+         auto_depth, depth_fmt, interval, R32(pp + 0x28));
+    uint32_t color_fmt = gpu::LinearColorFormat(fmt);
+    uint32_t zf = auto_depth ? gpu::LinearDepthFormat(depth_fmt) : 0;
+    // surfaces of the same shape are kept: a title wraps their memory in textures of its own across a Reset
+    static std::array<uint32_t, 5> made{};
+    std::array<uint32_t, 5> asked{w, h, color_fmt, std::min<uint32_t>(count + 1, 3), zf};
+    if (asked != made) {
+        made = asked;
+        g_buffer_count = asked[3];
+        for (uint32_t i = 0; i < g_buffer_count; i++) g_buffers[i] = NewSurface(w, h, color_fmt, 4);
+        g_depth = zf ? NewSurface(w, h, zf, zf == 0x30 || zf == 0x31 ? 2 : 4) : 0;  // 0x30 LIN_D16, 0x31 LIN_F16
+    }
+    if (!g_backend) {
+        g_backend = gpu::CreateBackend();
+        if (!g_backend->Init(w, h)) LOGE("d3d: renderer init failed");
+        if (kRenderThread) g_backend = gpu::CreateThreadedBackend(std::move(g_backend));
+    }
+    g_state.viewport = {0, 0, w, h, 0.0f, 1.0f};
+    SetDev(kDevRenderTarget, g_buffers[1]);
+    SetDev(kDevDepth, g_depth);
+    SetDev(kDevBackBuffer, g_buffers[1]);
+    SetDev(kDevFrontBuffer, g_buffers[1]);
+    float one = 1.0f, zs = g_depth && (R32(g_depth + 12) >> 8 & 0xFF) == 0x30 ? 65535.0f : 16777215.0f;
+    std::memcpy(HostPtr(kDevice + kDevSuperX), &one, 4);
+    std::memcpy(HostPtr(kDevice + kDevSuperY), &one, 4);
+    std::memcpy(HostPtr(kDevice + kDevZScale), &zs, 4);
+    // fields the library's init sets that inlined library code and the default states read
+    if (XDK_CDevice_AutoDepth != xdk::kUnknown) SetDev(XDK_CDevice_AutoDepth, g_depth);
+    if (XDK_CDevice_BackBufferScale != xdk::kUnknown) {
+        std::memcpy(HostPtr(kDevice + XDK_CDevice_BackBufferScale), &one, 4);
+        std::memcpy(HostPtr(kDevice + XDK_CDevice_BackBufferScale + 4), &one, 4);
+    }
+    g_state.rt = SurfaceOf(g_buffers[1]);
+    g_state.zs = SurfaceOf(g_depth);
+    UpdateViewportConstants();
+}
+
 constexpr bool kVBlank = XDK_CDevice_VBlankCount != xdk::kUnknown && XDK_CDevice_VBlankEvent != xdk::kUnknown &&
                          XDK_CDevice_VBlankCallback != xdk::kUnknown;
 
@@ -1337,17 +1382,18 @@ static void DrawInline(uint32_t prim, const std::vector<uint32_t>& vertices) {
     else LOG_FIRST(8, "d3d: EndPush primitive %u dropped, %u bytes of vertices of %u", prim, bytes, stride);
 }
 
-HLE_STDCALL(D3DDevice_EndPush, 1) {
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
+static void RunCommands(uint32_t begin, uint32_t end) {
     constexpr uint32_t kBeginEnd = 0x17FC, kInlineArray = 0x1818;
+    // vertex array offsets and formats, then index elements and draw arrays up to the inline array
+    constexpr uint32_t kArrayOffsets = 0x1720, kArrayFormatsEnd = 0x17A0, kArrayDraws = 0x1800;
     static std::vector<uint32_t> vertices;
     uint32_t prim = 0;
-    for (uint32_t p = g_push_begin, end = a[0]; g_push_begin && p + 4 <= end;) {
+    for (uint32_t p = begin; begin && p + 4 <= end;) {
         // count in bits 18 to 28, bit 30 keeps the method for every value
         uint32_t head = R32(p), method = head & 0x1FFC, n = (head >> 18) & 0x7FF;
         p += 4;
         if ((head & 0xA0030003) || n * 4 > end - p) {  // anything but a method header
-            LOG_FIRST(8, "d3d: EndPush stops at command %08X, %u bytes before the end", head, end - p);
+            LOG_FIRST(8, "d3d: pushed commands stop at %08X, %u bytes before the end", head, end - p);
             break;
         }
         for (uint32_t i = 0; i < n; i++, p += 4) {
@@ -1360,14 +1406,33 @@ HLE_STDCALL(D3DDevice_EndPush, 1) {
                 prim = v;
                 vertices.clear();
                 ApplyImmediate(m, v);
+            } else if ((m >= kArrayOffsets && m < kArrayFormatsEnd) || (m >= kArrayDraws && m < kInlineArray)) {
+                LOG_FIRST(16, "d3d: pushed commands draw from vertex arrays (method %04X), which is not run", m);
             } else if (!ApplyConstant(m, v) && !ApplyImmediate(m, v) && m >> 2 < g_state.simple.size()) {
                 g_state.simple[m >> 2] = v;
             }
         }
     }
+}
+
+HLE_STDCALL(D3DDevice_EndPush, 1) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    RunCommands(g_push_begin, a[0]);
     g_push_begin = 0;
     ScratchPush();
     return a[0];
+}
+
+// (push buffer, fixup): its commands run as EndPush runs a title's, after the ones pushed before it. D3DPushBuffer is
+// Common, Data, Lock, Size; the library runs Size less its last dword.
+HLE_STDCALL(D3DDevice_RunPushBuffer, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    uint32_t data = R32(a[0] + 4), size = R32(a[0] + 12);
+    LOG_FIRST(8, "d3d: RunPushBuffer %08X, %u bytes, first command %08X", data, size, size ? R32(data) : 0);
+    if (a[1]) LOG_FIRST(1, "d3d: RunPushBuffer fixups are not applied");
+    Walk(Dev(kDevPush));
+    if (size >= 4) RunCommands(data, data + size - 4);
+    return 0;
 }
 
 // frame buffer compression tiles are the console's memory controller's business
