@@ -59,6 +59,10 @@ bool InCode(uint32_t va);  // cpu/dispatch.cpp
 #define SYM_D3DDevice_GetRasterStatus FFFFFE07
 #define HAS_D3DDevice_GetRasterStatus 0
 #endif
+#ifndef SYM_D3DDevice_Reset
+#define SYM_D3DDevice_Reset FFFFFE08
+#define HAS_D3DDevice_Reset 0
+#endif
 #endif
 
 namespace d3d {
@@ -635,6 +639,17 @@ HLE_STDCALL(D3DDevice_Clear, 6) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     const uint8_t* rects = a[0] && a[1] ? static_cast<const uint8_t*>(HostPtr(a[1])) : nullptr;
     if (g_backend) g_backend->Clear(g_state, a[0], rects, a[2], a[3], ArgF(a, 4), a[5]);
+    return 0;
+}
+
+// (pp): the frame buffers pp asks for, the targets on them and cleared, as the library's Reset leaves the device.
+// The device's references move back to the frame buffers first, so kept ones hold theirs as CreateDevice made them.
+HLE_STDCALL(D3DDevice_Reset, 1) {
+    constexpr uint32_t kClearTargetAndZ = 3;
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    ApplyRenderTarget(ctx, g_buffers[1], g_depth);
+    SetFrameBuffers("Reset", a[0]);
+    if (g_backend) g_backend->Clear(g_state, 0, nullptr, kClearTargetAndZ, 0, 1.0f, 0);
     return 0;
 }
 
