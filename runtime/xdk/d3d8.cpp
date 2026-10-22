@@ -369,6 +369,11 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
     }
     // 60 Hz, widescreen
     if (XDK_CDevice_DisplayFlags != xdk::kUnknown) SetDev(XDK_CDevice_DisplayFlags, 0x400000 | (app::Widescreen() ? 0x10000 : 0));
+    // the miniport's hardware init leaves an identity ramp in slot 0, which GetGammaRamp reads until one is set
+    if (XDK_CDevice_GammaRamps != xdk::kUnknown) {
+        uint8_t* ramp = static_cast<uint8_t*>(HostPtr(kDevice + XDK_CDevice_GammaRamps));  // red, green, blue
+        for (uint32_t i = 0; i < 256; i++) ramp[i] = ramp[256 + i] = ramp[512 + i] = uint8_t(i);
+    }
 #if HAS_D3D_FvfShader
     if (XDK_CDevice_VertexShader != xdk::kUnknown) SetDev(XDK_CDevice_VertexShader, SYM(D3D_FvfShader));
 #endif
@@ -515,9 +520,13 @@ HLE_STDCALL(D3DDevice_PersistDisplay, 0) {
 }
 HLE_STDCALL(D3DDevice_FlushVertexCache, 0) { return 0; }
 
+// The library keeps the ramp in one of two device slots for GetGammaRamp: both get it, whichever one its index names
 HLE_STDCALL(D3DDevice_SetGammaRamp, 2) {
     uint8_t ramp[768];
     std::memcpy(ramp, HostPtr(a[1]), 768);
+    if (XDK_CDevice_GammaRamps != xdk::kUnknown)
+        for (uint32_t slot = 0; slot < 2; slot++)
+            std::memcpy(HostPtr(kDevice + XDK_CDevice_GammaRamps + slot * sizeof(ramp)), ramp, sizeof(ramp));
     if (g_backend) g_backend->SetGamma(ramp);
     return 0;
 }
