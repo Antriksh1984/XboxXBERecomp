@@ -36,6 +36,12 @@ struct Target {
     DXGI_FORMAT fmt = DXGI_FORMAT_B8G8R8A8_UNORM;
     float range = 1;         // colour held divided by it until the extension resolves the target
     uint64_t tag = ~0ull;    // the extension's
+    // multisampled: draws go to ms through view, res holds its resolve for everything that reads the target
+    Microsoft::WRL::ComPtr<ID3D12Resource> ms;
+    D3D12_RESOURCE_STATES ms_state = D3D12_RESOURCE_STATE_COMMON;
+    uint32_t samples = 1;
+    uint32_t res_view = 0;    // a depth target's res as a DSV, which its resolve writes
+    bool unresolved = false;  // ms was drawn since res was last resolved from it
 };
 
 // what the renderer lends an extension, on the render thread

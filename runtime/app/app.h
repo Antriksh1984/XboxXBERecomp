@@ -23,6 +23,7 @@ struct Settings {
     uint32_t fps_cap = 60;           // 0 unlimited, kFpsCapRefresh the monitor's refresh rate
     bool vsync = true;
     uint32_t aniso = 0;              // 0 as the game asks
+    uint32_t msaa = 1;               // samples per pixel of the screen sized targets, 1 off
     std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
 };
 
