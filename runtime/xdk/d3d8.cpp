@@ -344,8 +344,10 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
     ScratchPush();
     g_state = gpu::State{};
     SetFrameBuffers("CreateDevice", a[4]);
-    // 60 Hz, widescreen
-    if (XDK_CDevice_DisplayFlags != xdk::kUnknown) SetDev(XDK_CDevice_DisplayFlags, 0x400000 | (app::Widescreen() ? 0x10000 : 0));
+    // 60 Hz, widescreen, 720p for a 720 line frame
+    if (XDK_CDevice_DisplayFlags != xdk::kUnknown)
+        SetDev(XDK_CDevice_DisplayFlags, 0x400000 | (app::Widescreen() ? 0x10000 : 0) |
+                                             (R32(a[4] + 4) == 720 ? 0x20000 : 0));
     // the miniport's hardware init leaves an identity ramp in slot 0, which GetGammaRamp reads until one is set
     if (XDK_CDevice_GammaRamps != xdk::kUnknown) {
         uint8_t* ramp = static_cast<uint8_t*>(HostPtr(kDevice + XDK_CDevice_GammaRamps));  // red, green, blue

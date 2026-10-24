@@ -95,7 +95,9 @@ void InitKernelData() {
     PutAnsi(DataAddress(41), "RECOMP HARD DISK");
     PutAnsi(DataAddress(42), "0000000000000000");
     W32(DataAddress(40), 3);
-    W32(DataAddress(356), 0);
+    // the AV pack the SMC saw at boot: HDTV (1) where the title gets 720p, which XGetVideoFlags needs to keep the
+    // HDTV modes, else SCART (0)
+    W32(DataAddress(356), app::Hdtv720p() ? 1 : 0);
     // IDE_CHANNEL_OBJECT DeviceQueue.DeviceListHead, XAPI walks it to cancel file I/O
     uint32_t queue = DataAddress(357) + 0x28;
     W32(queue, queue);
@@ -1222,8 +1224,10 @@ KERNEL_EXPORT(29, ExSaveNonVolatileSetting, 4) {
 
 // settings and hardware
 
-// widescreen (a 4:3 output plays the console's 4:3), 480p
-static uint32_t VideoFlags() { return (app::Widescreen() ? 0x00010000 : 0) | 0x00080000; }
+// widescreen (a 4:3 output plays the console's 4:3), 480p, and 720p where the title has the mode
+static uint32_t VideoFlags() {
+    return (app::Widescreen() ? 0x00010000 : 0) | (app::Hdtv720p() ? 0x00020000 : 0) | 0x00080000;
+}
 
 KERNEL_EXPORT(24, ExQueryNonVolatileSetting, 5) {
     uint32_t index = a[0], type_out = a[1], value = a[2], len = a[3], result_len = a[4];

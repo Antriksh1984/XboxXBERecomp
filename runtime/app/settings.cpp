@@ -125,6 +125,8 @@ bool Widescreen() {
     return wide;
 }
 
+bool Hdtv720p() { return kGame.hdtv_720p && Widescreen(); }
+
 float RenderScale(uint32_t guest_height) {
     float h = Output().height * (Get().render_percent / 100.0f);
     return guest_height ? std::max(h / guest_height, 0.1f) : 1.0f;

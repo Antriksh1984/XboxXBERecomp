@@ -41,6 +41,8 @@ Mode Output();
 float RenderScale(uint32_t guest_height);
 // the output is 3:2 or wider: the console reports a widescreen TV and the frame is shown 16:9, else 4:3 as on a 4:3 TV
 bool Widescreen();
+// the console reports 720p as well (GameInfo::hdtv_720p)
+bool Hdtv720p();
 
 std::filesystem::path ExeDir();
 // the game in assets (game_files.cpp): its folder and this executable's xbe, from the extracted files or a disc
@@ -96,6 +98,8 @@ struct GameInfo {
     void (*ui)(double fps);        // each frame inside the ImGui frame, UiLock held
     void (*pad)(int port, input::Pad& pad);  // a polled pad before the game gets it
     void (*rumble)(int port, uint16_t& left, uint16_t& right);
+    // the title has a 1280x720 mode: on a widescreen output the console reports 720p, and D3D offers the mode
+    bool hdtv_720p;
 };
 extern const GameInfo kGame;
 
